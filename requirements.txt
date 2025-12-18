@@ -1,0 +1,19 @@
+# FFT-Tensor Requirements
+
+# Core dependencies
+torch>=2.0.0
+numpy>=1.21.0
+
+# Optional: for advanced features
+scipy>=1.7.0
+
+# Development dependencies (install with: pip install -e .[dev])
+# pytest>=7.0.0
+# pytest-cuda>=0.1.0
+# black>=22.0.0
+# flake8>=4.0.0
+# mypy>=0.950
+
+# Documentation (install with: pip install -e .[docs])
+# sphinx>=4.0.0
+# sphinx-rtd-theme>=1.0.0
