@@ -7,7 +7,7 @@ Run 120B+ models on 6GB VRAM through:
 - Streaming execution: Process arbitrarily large models in fixed memory
 """
 
-from .tensor import SparseSpectralTensor, sst, zeros_sst, MemoryManager
+from .tensor import SparseSpectralTensor, sst, zeros_sst, randn_sst, MemoryManager
 from .ops import (
     spectral_conv,
     spectral_pool,
@@ -23,6 +23,7 @@ __all__ = [
     'SparseSpectralTensor',
     'sst',
     'zeros_sst',
+    'randn_sst',
     'MemoryManager',
     'spectral_conv',
     'spectral_pool',

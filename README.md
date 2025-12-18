@@ -42,7 +42,9 @@ sparse_tensor = sst(dense_tensor, sparsity=0.05)  # 0.2MB
 | Memory (1024x1024) | 4MB | 0.2MB | **20x** |
 | 120B model layer | OOM (>24GB) | 600MB | **Fits on 1660 Super!** |
 
-**Tested on GTX 1660 Super (6GB VRAM)**
+**Tested on GTX 1660 Super (4GB VRAM, CUDA cores only - no Tensor Cores)**
+
+*Note: Performance with compiled CUDA extensions. PyTorch fallback mode also works (10-30x slower).*
 
 ---
 

@@ -1,6 +1,10 @@
 """
 Basic usage examples for FFT-Tensor
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import torch
 from fft_tensor import sst, zeros_sst, randn_sst, MemoryManager
 
