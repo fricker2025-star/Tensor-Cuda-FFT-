@@ -17,6 +17,14 @@ from .ops import (
     implicit_matmul,
     spectral_backward
 )
+from .frequency_ops import (
+    FrequencyMatMul,
+    FrequencyAttention,
+    ComplexSemanticEmbedding,
+    FrequencyTransformerLayer,
+    frequency_relu,
+    frequency_layernorm
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -32,6 +40,13 @@ __all__ = [
     'ImplicitWeights',
     'implicit_matmul',
     'spectral_backward',
+    # Frequency domain operations (no materialization!)
+    'FrequencyMatMul',
+    'FrequencyAttention',
+    'ComplexSemanticEmbedding',
+    'FrequencyTransformerLayer',
+    'frequency_relu',
+    'frequency_layernorm',
 ]
 
 # Set default memory limit (5GB for 1660 Super)
