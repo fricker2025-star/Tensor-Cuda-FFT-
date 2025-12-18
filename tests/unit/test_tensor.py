@@ -4,7 +4,10 @@ Unit tests for SparseSpectralTensor
 import torch
 import pytest
 import sys
-sys.path.insert(0, '.')
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from fft_tensor.tensor import SparseSpectralTensor, sst, zeros_sst, randn_sst, MemoryManager
 
