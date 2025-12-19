@@ -19,10 +19,8 @@ O(n log n) global context mixing for long sequences using learnable spectral fil
 ## Quick Start
 
 ```bash
-pip install torch>=2.0.0 numpy
-git clone https://github.com/yourusername/fft-tensor.git
-cd fft-tensor
-pip install -e .
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 ### Basic Usage
@@ -37,6 +35,13 @@ layer = SpectralMixingLayer(embed_dim=256)
 x = torch.randn(8, 512, 256)
 y = layer(x)  # O(n log n) global context
 ```
+
+### Examples
+
+See:
+
+- `examples/basic_usage.py`
+- `examples/neural_network.py`
 
 ### In Your Model
 
@@ -63,6 +68,53 @@ class MyModel(nn.Module):
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - Theory, Wirtinger calculus, design decisions
 - **[BENCHMARKS.md](BENCHMARKS.md)** - Complete performance data
+- **[INSTALL.md](INSTALL.md)** - Installation
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contributing
+
+## Language Model (Practical Pipeline)
+
+This repo now also contains a **byte-level spectral language model** built on top of the causal FFT-conv backbone.
+
+### Project layout (current)
+
+- `fft_tensor/` – spectral tensor ops + kernels
+- `fft_lm/` – LM backbone + chunk head
+- `scripts/` – runnable entrypoints
+- `experiments/` – one-off debug scripts
+
+### Recommended training (backbone)
+
+```powershell
+# 1024-context backbone training (with accumulation)
+python -m fft_lm.train_fixed_full --seq-len 1024 --kernel-len 128 --lr 0.0002 `
+  --batch-size 4 --accum-steps 8 --steps-per-epoch 1000 --epochs 200 `
+  --ckpt-path fixed_spectral_ckpt_1024.pt --log-every-steps 50
+```
+
+### Piston-engine training (chunk head)
+
+This is the generation path that avoids the "leaky faucet" full-context recompute:
+
+```powershell
+python -m scripts.train_chunk_head --seq-len 1024 --kernel-len 128 --chunk 16 `
+  --batch-size 4 --accum-steps 8 --steps-per-epoch 1000 --epochs 50 `
+  --lr 0.0002 --ckpt chunklm_ckpt_1024.pt --log-every 10
+```
+
+### Generation
+
+- Fast chunk generation (simple): `scripts/generate_chunked.py`
+- **Exact overlap-save state update (recommended):** `scripts/generate_chunked_overlap_save.py`
+
+```powershell
+python -m scripts.generate_chunked_overlap_save --ckpt chunklm_ckpt_1024.pt `
+  --prompt Once upon a time --seq-len 1024 --kernel-len 128 --chunk 16 --chunks 30
+```
+
+## Reality checks (to keep it sound)
+
+- Very low training loss can indicate leakage or memorization. Always check generation quality.
+- For curriculum stages, ensure the cutoff bins match the FFT size used by the causal FFT-conv.
 
 ---
 

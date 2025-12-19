@@ -1,4 +1,4 @@
-"""train_fixed_full.py
+"""fft_lm.train_fixed_full
 
 Fixed spectral mixer training on TinyStories with non-greedy sampling.
 

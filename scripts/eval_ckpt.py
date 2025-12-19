@@ -18,7 +18,7 @@ import os
 
 import torch
 
-import train_fixed_full as tff
+from fft_lm import train_fixed_full as tff
 
 
 def main() -> None:
@@ -71,11 +71,12 @@ def main() -> None:
     val_starts = tff.make_val_starts(n, cfg.seq_len, cfg.val_windows, cfg.seed + 1)
 
     # Evaluate val loss using full horizon (cutoff=None) and current schedule horizon
-    freq_bins = cfg.seq_len // 2 + 1
+    freq_bins = tff.conv_freq_bins(cfg.seq_len, cfg.kernel_len)
     # if ckpt epoch is known, use schedule at that epoch-1
     sched_cutoff = None
     if isinstance(epoch, int) and epoch > 0:
-        sched_cutoff = tff.jpeg_cutoff(epoch - 1, cfg, freq_bins)
+        # Use the same strict curriculum as training.
+        sched_cutoff = tff.curriculum_cutoff(epoch - 1, cfg, freq_bins)
 
     vloss_full = tff.eval_loss(model, corpus_u8, val_starts, cfg, cutoff=None)
     vloss_sched = tff.eval_loss(model, corpus_u8, val_starts, cfg, cutoff=sched_cutoff) if sched_cutoff is not None else vloss_full

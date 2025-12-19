@@ -31,9 +31,12 @@ jobs:
     - name: Verify package structure
       run: |
         ls -la fft_tensor/
+        ls -la fft_lm/ || true
+        ls -la scripts/ || true
         test -f fft_tensor/__init__.py && echo "✓ Package found"
         test -f fft_tensor/tensor.py && echo "✓ tensor.py found"
         test -f fft_tensor/ops.py && echo "✓ ops.py found"
+        test -f fft_lm/train_fixed_full.py && echo "✓ fft_lm/train_fixed_full.py found" || true
     
     - name: Check Python syntax
       run: |
@@ -73,12 +76,12 @@ jobs:
     
     - name: Check code formatting with black
       run: |
-        black --check fft_tensor/ tests/ examples/ || echo "⚠ Code formatting issues found (non-blocking)"
+        black --check fft_tensor/ fft_lm/ scripts/ tests/ examples/ || echo "⚠ Code formatting issues found (non-blocking)"
       continue-on-error: true
     
     - name: Check code style with flake8
       run: |
-        flake8 fft_tensor/ tests/ examples/ --max-line-length=100 --extend-ignore=E203,W503,E501 || echo "⚠ Style issues found (non-blocking)"
+        flake8 fft_tensor/ fft_lm/ scripts/ tests/ examples/ --max-line-length=100 --extend-ignore=E203,W503,E501 || echo "⚠ Style issues found (non-blocking)"
       continue-on-error: true
 
   docs:

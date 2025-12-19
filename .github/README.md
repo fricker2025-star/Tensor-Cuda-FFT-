@@ -1,12 +1,12 @@
-# FFT-Tensor: Byte-Level Spectral Language Models
+# FFT-Tensor
 
-Spectral language models with Triton-optimized byte encoding. No tokenizer needed.
+Sparse spectral tensor utilities + an experimental byte-level spectral LM.
 
-**Status:** Research | **Tests:** 33/35 (94%) | **Python:** 3.9-3.12 | **PyTorch:** 2.0+ | **Triton:** 3.5.1 (Windows)
+**Status:** Experimental | **Python:** 3.9–3.12 | **PyTorch:** 2.0+
 
 ---
 
-## Key Innovations
+## Key ideas
 
 ### 1. Wirtinger Calculus for Complex Gradients
 
@@ -37,7 +37,7 @@ Smart bit allocation for complex weights:
 
 **Key insight:** Phase encodes semantics → allocate more bits to phase.
 
-### 3. Triton Integration ⚡ NEW!
+### 3. Triton Integration (optional)
 
 First Triton-Windows implementation for byte-spectral encoding:
 
@@ -72,10 +72,21 @@ def byte_to_spectral_kernel(byte_ptr, output_ptr, B, T, D):
 
 ---
 
-## Validation Results
+## What’s practical today
 
-### Standard Spectral Model (Previous)
-Text classification (256 tokens, synthetic):
+### Core library
+
+- Spectral tensor ops + utilities live in `fft_tensor/`.
+
+### LM pipeline (byte-level)
+
+The LM code lives in `fft_lm/` with runnable scripts in `scripts/`.
+
+The recommended *generation* path is a chunk-based “piston engine”:
+
+- train backbone + chunk head end-to-end
+- generate 16 bytes at a time
+- update backbone state via overlap-save (chunkwise)
 
 | Metric | FFT-Tensor | Transformer | Speedup |
 |--------|------------|-------------|---------|
@@ -84,7 +95,21 @@ Text classification (256 tokens, synthetic):
 | Accuracy | 100% | 100% | Same |
 | Parameters | 169K | 204K | 1.21x fewer |
 
-### Triton-Integrated Byte-Spectral (Current)
+## Repo layout
+
+- `fft_tensor/` – core library
+- `fft_lm/` – LM backbone + chunk head
+- `scripts/` – training / generation entrypoints
+- `experiments/` – scratch / diagnostics
+
+## Notes on metrics
+
+If you see extremely low byte-level perplexity on small corpora, validate with:
+
+- qualitative generation
+- held-out evaluation
+
+Byte-level corpora contain predictable patterns; don’t treat “too good” perplexity as proof of language understanding.
 
 **Small Sequences (64 tokens):**
 | Metric | Triton-Spectral | Traditional | Result |

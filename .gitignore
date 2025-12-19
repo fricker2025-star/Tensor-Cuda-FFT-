@@ -24,6 +24,13 @@ wheels/
 *.pth
 *.pt
 
+# Large local datasets
+tinystories_train.txt
+data/*.txt
+
+# Local caches
+unsloth_compiled_cache/
+
 # CUDA
 *.o
 *.cu.o
