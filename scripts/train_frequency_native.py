@@ -1,18 +1,17 @@
-"""train_chunk_head.py
+"""train_frequency_native.py
 
-Train a CHUNK-PREDICTING head on top of the causal spectral backbone.
+Train the FREQUENCY-NATIVE architecture with phase activations.
 
-This is the missing link for the "Piston Engine":
-  - predict 16 bytes at once (or any chunk size)
-  - sample a chunk
-  - quantization barrier is inherent (sampled ints)
-  - slide window and repeat
-
-This avoids token-by-token O(T^2) generation because we only run the backbone
-once per chunk.
+This is the experimental "galaxy brain" version where:
+- All operations stay in frequency domain
+- Phase rotations replace time-domain nonlinearities
+- Gradients flow through spectral space
+- Custom autograd for O(1) gradient computation
 
 Run:
-  python train_chunk_head.py --seq-len 1024 --chunk 16 --steps-per-epoch 1000 --batch-size 4 --accum-steps 8 --lr 0.0002
+  python -m scripts.train_frequency_native --seq-len 1024 --kernel-len 128 --chunk 16 \
+    --batch-size 4 --accum-steps 8 --steps-per-epoch 1000 --epochs 50 --lr 0.0002 \
+    --ckpt chunklm_freq_native_ckpt.pt
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ import torch
 import torch.nn as nn
 
 from fft_lm import train_fixed_full as tff
-from fft_lm.chunk_head import ChunkLM, vectorized_windows
+from fft_lm.chunk_head import ChunkLM
 from fft_lm.ckpt_io import save_checkpoint, load_checkpoint
 
 
@@ -41,14 +40,11 @@ def main():
     ap.add_argument("--accum-steps", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--wd", type=float, default=5e-4)
-    ap.add_argument("--ckpt", default="chunklm_ckpt.pt")
+    ap.add_argument("--ckpt", default="chunklm_freq_native_ckpt.pt")
     ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--no-sawtooth", action="store_true")
-    ap.add_argument("--use-ema", action="store_true")
-    ap.add_argument("--ema-chunk-len", type=int, default=16)
-    ap.add_argument("--ema-rho-init", type=float, default=0.95)
-    ap.add_argument("--ema-mode", type=str, default="aligned", choices=["aligned", "polar"])
+    ap.add_argument("--compile", action="store_true", help="Use torch.compile() for faster training (PyTorch 2.0+)")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -57,7 +53,7 @@ def main():
     if not os.path.exists(args.data):
         raise SystemExit(f"Missing data: {args.data}")
 
-    # reuse backbone config
+    # Config with frequency-native mode ENABLED
     cfg = tff.TrainConfig(
         data_path=args.data,
         seq_len=args.seq_len,
@@ -69,6 +65,9 @@ def main():
         steps_per_epoch=args.steps_per_epoch,
         epochs=args.epochs,
         ckpt_path=args.ckpt,
+        frequency_native=True,  # 🚀 ENABLE FREQUENCY-NATIVE MODE
+        use_fp32=True,  # Use FP32 for complex arithmetic (faster, less casting)
+        amp=False,  # Disable AMP for frequency-native (complex ops don't mix well with FP16)
     )
     cfg.device = device
     tff.set_seed(cfg.seed)
@@ -79,30 +78,21 @@ def main():
     if hi <= 0:
         raise SystemExit("Dataset too small for requested seq_len+chunk")
 
-    # Auto-detect EMA from checkpoint if resuming
-    use_ema = args.use_ema
-    ema_chunk_len = args.ema_chunk_len
-    ema_rho_init = args.ema_rho_init
-    ema_mode = args.ema_mode
-    
-    if args.resume and os.path.exists(cfg.ckpt_path):
-        ck = load_checkpoint(cfg.ckpt_path, map_location="cpu")
-        # Check if checkpoint has EMA parameters
-        model_keys = list(ck["model"].keys())
-        ckpt_has_ema = any("ema" in k for k in model_keys)
-        if ckpt_has_ema:
-            print(f"Detected EMA in checkpoint, enabling EMA for model")
-            use_ema = True
-    
+    # Build frequency-native model
     backbone = tff.FixedSpectralLM(cfg).to(device)
-    model = ChunkLM(
-        backbone,
-        chunk=args.chunk,
-        use_ema=use_ema,
-        ema_chunk_len=ema_chunk_len,
-        ema_rho_init=ema_rho_init,
-        ema_mode=ema_mode,
-    ).to(device)
+    model = ChunkLM(backbone, chunk=args.chunk, use_ema=False).to(device)
+    
+    # Apply torch.compile for fused operations and custom kernels
+    # NOTE: torch.compile has issues with complex tensors (stride mismatches)
+    # Skipping for now - the complex64 optimization alone is enough
+    if args.compile:
+        print("=" * 70)
+        print("[INFO] torch.compile() requested but DISABLED for frequency-native")
+        print("Reason: PyTorch compile has stride issues with complex tensors")
+        print("The complex64 dtype optimization is still active!")
+        print("=" * 70)
+        # Uncomment when PyTorch fixes complex tensor compile support:
+        # model = torch.compile(model, mode="reduce-overhead")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp)
@@ -110,6 +100,7 @@ def main():
 
     start_epoch = 0
     if args.resume and os.path.exists(cfg.ckpt_path):
+        ck = load_checkpoint(cfg.ckpt_path, map_location="cpu")
         model.load_state_dict(ck["model"], strict=True)
         opt.load_state_dict(ck["opt"])
         if ck.get("scaler") is not None and cfg.amp:
@@ -126,15 +117,15 @@ def main():
                 "scaler": scaler.state_dict() if cfg.amp else None,
                 "cfg": cfg.__dict__,
                 "chunk": args.chunk,
+                "frequency_native": True,
             },
             cfg.ckpt_path,
         )
 
     print("=" * 70)
-    print("TRAIN CHUNK HEAD (Piston Engine)")
+    print("TRAIN FREQUENCY-NATIVE CHUNK LM")
     print("=" * 70)
     print(f"device={device} seq_len={cfg.seq_len} kernel_len={cfg.kernel_len} chunk={args.chunk}")
-    print(f"ema: use={args.use_ema} mode={args.ema_mode} ema_chunk_len={args.ema_chunk_len} ema_rho_init={args.ema_rho_init}")
     print(f"micro_batch={cfg.batch_size} accum={cfg.accum_steps} effective={cfg.batch_size*cfg.accum_steps}")
     print(f"steps/epoch={cfg.steps_per_epoch} epochs={cfg.epochs} lr={cfg.lr} wd={cfg.weight_decay}")
     if not args.no_sawtooth:
@@ -154,20 +145,14 @@ def main():
     
     # Adaptive cutoff state
     freq_bins = tff.conv_freq_bins(cfg.seq_len, cfg.kernel_len)
-    
-    # IMPORTANT: When resuming, infer the current cutoff from the epoch we're at
-    # Don't regress to a lower cutoff than what the model has already learned!
     if start_epoch >= 1:
-        # Model has already proven it can handle higher frequencies
-        # Start at the curriculum level it should be at
         current_cutoff = tff.curriculum_cutoff(start_epoch, cfg, freq_bins)
-        print(f"Resuming at epoch {start_epoch}: inferred cutoff={current_cutoff} (don't regress!)")
+        print(f"Resuming at epoch {start_epoch}: inferred cutoff={current_cutoff}")
     else:
-        # Start at 128 (64 is too blurry, no point)
         current_cutoff = 128
         print(f"Starting at cutoff=128 (basic syntax/characters)")
     
-    loss_history = []  # Track all optimizer step losses for plateau detection
+    loss_history = []
     cutoff_was_raised_this_step = False
     
     try:
@@ -187,8 +172,7 @@ def main():
             )
             
             if cutoff_raised:
-                print(f"🚀 CUTOFF RAISED: {prev_cutoff} -> {current_cutoff} (loss plateaued, opening frequency gates)")
-                # Clear old history to restart plateau detection
+                print(f"🚀 CUTOFF RAISED: {prev_cutoff} -> {current_cutoff} (loss plateaued)")
                 loss_history = []
 
             opt.zero_grad(set_to_none=True)
@@ -199,13 +183,12 @@ def main():
             for micro in range(micro_total):
                 opt_step = micro // cfg.accum_steps
                 
-                # Reset cutoff_raised flag after first step of epoch
                 if opt_step > 0:
                     cutoff_was_raised_this_step = False
                 else:
                     cutoff_was_raised_this_step = cutoff_raised
 
-                # LR schedule on optimizer steps - RESTART when cutoff raised
+                # LR schedule - RESTART when cutoff raised
                 if not args.no_sawtooth:
                     global_opt_step = epoch * cfg.steps_per_epoch + opt_step
                     lr_now = tff.sawtooth_lr(global_opt_step, epoch, cfg, cutoff_raised=cutoff_was_raised_this_step)
@@ -213,12 +196,13 @@ def main():
                         pg["lr"] = lr_now
 
                 starts = torch.randint(0, hi, (cfg.batch_size,), dtype=torch.long)
+                from fft_lm.chunk_head import vectorized_windows
                 bx, by = vectorized_windows(corpus_u8, starts, cfg.seq_len, args.chunk)
                 bx = bx.to(device, non_blocking=True)
                 by = by.to(device, non_blocking=True)
 
                 with torch.autocast("cuda", enabled=cfg.amp):
-                    logits = model(bx, cutoff=current_cutoff)  # [B,chunk,256]
+                    logits = model(bx, cutoff=current_cutoff)
                     loss = loss_fn(logits.reshape(-1, 256), by.reshape(-1))
                     loss = loss / float(cfg.accum_steps)
 
@@ -233,7 +217,7 @@ def main():
 
                     li = float(loss.item()) * float(cfg.accum_steps)
                     losses.append(li)
-                    loss_history.append(li)  # Track for plateau detection
+                    loss_history.append(li)
                     running += li
                     if (opt_step + 1) % args.log_every == 0:
                         lr_disp = opt.param_groups[0]["lr"]
@@ -247,17 +231,14 @@ def main():
                 last_saved_epoch = epoch + 1
 
     except KeyboardInterrupt:
-        # Save on Ctrl+C
         print("\n[Ctrl+C] Saving checkpoint...")
-        # Save the current epoch index (best-effort)
         save(max(last_saved_epoch, start_epoch))
         print(f"Saved to {cfg.ckpt_path}")
         raise
     finally:
-        # Always save a final checkpoint at exit
         save(max(last_saved_epoch, start_epoch))
 
-    print("DONE")
+    print("DONE - FREQUENCY-NATIVE TRAINING COMPLETE")
 
 
 if __name__ == "__main__":

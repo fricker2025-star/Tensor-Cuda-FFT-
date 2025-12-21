@@ -1,18 +1,14 @@
-"""train_chunk_head.py
+"""scripts.train_chunk_lm
 
-Train a CHUNK-PREDICTING head on top of the causal spectral backbone.
+Single-file training entrypoint that contains BOTH:
+  - the chunk head ("mouth")
+  - the end-to-end training loop updating backbone + head together
 
-This is the missing link for the "Piston Engine":
-  - predict 16 bytes at once (or any chunk size)
-  - sample a chunk
-  - quantization barrier is inherent (sampled ints)
-  - slide window and repeat
+It imports the backbone implementation from `fft_lm.train_fixed_full`.
 
-This avoids token-by-token O(T^2) generation because we only run the backbone
-once per chunk.
-
-Run:
-  python train_chunk_head.py --seq-len 1024 --chunk 16 --steps-per-epoch 1000 --batch-size 4 --accum-steps 8 --lr 0.0002
+Run from repo root:
+  python -m scripts.train_chunk_lm --seq-len 1024 --kernel-len 128 --chunk 16 --batch-size 4 --accum-steps 8 \
+    --steps-per-epoch 1000 --epochs 50 --lr 0.0002 --ckpt chunklm_ckpt_1024.pt --log-every 10
 """
 
 from __future__ import annotations
@@ -25,8 +21,69 @@ import torch
 import torch.nn as nn
 
 from fft_lm import train_fixed_full as tff
-from fft_lm.chunk_head import ChunkLM, vectorized_windows
+from fft_lm.spectral_ssm import SpectralEMA, EMAConfig
 from fft_lm.ckpt_io import save_checkpoint, load_checkpoint
+
+
+class ChunkLM(nn.Module):
+    """Backbone + non-autoregressive chunk head (predicts N future bytes at once)."""
+
+    def __init__(
+        self,
+        backbone: tff.FixedSpectralLM,
+        chunk: int,
+        *,
+        use_ema: bool = False,
+        ema_chunk_len: int = 16,
+        ema_rho_init: float = 0.95,
+        ema_mode: str = "aligned",
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.chunk = int(chunk)
+        d_model = backbone.embed.weight.shape[1]
+        self.head = nn.Linear(d_model, 256 * self.chunk)
+        nn.init.normal_(self.head.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.head.bias)
+
+        self.use_ema = bool(use_ema)
+        self.ema_chunk_len = int(ema_chunk_len)
+        if self.use_ema:
+            n_freqs = self.ema_chunk_len // 2 + 1
+            self.ema = SpectralEMA(EMAConfig(n_freqs=n_freqs, rho_init=ema_rho_init, mode=ema_mode))
+            self.ema_proj = nn.Linear(2 * n_freqs, d_model)
+            nn.init.normal_(self.ema_proj.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(self.ema_proj.bias)
+
+    def forward(self, x: torch.Tensor, cutoff: int | None = None) -> torch.Tensor:
+        # hidden from backbone
+        h = self.backbone.forward_hidden(x, cutoff=cutoff)  # [B,T,C]
+        last = h[:, -1, :]
+
+        if self.use_ema:
+            B, T = x.shape
+            L = self.ema_chunk_len
+            S = T // L
+            if S > 0:
+                xx = x[:, : S * L].reshape(B, S, L).to(torch.float32)
+                xx = (xx / 127.5) - 1.0
+                fft_chunks = torch.fft.rfft(xx, dim=-1)  # [B,S,F] complex
+                ema_state = self.ema.scan(fft_chunks)    # [B,F] complex
+                feat = torch.view_as_real(ema_state).reshape(B, -1)
+                last = last + self.ema_proj(feat.to(last.dtype))
+
+        flat = self.head(last)
+        return flat.view(x.size(0), self.chunk, 256)
+
+
+def vectorized_windows(corpus_u8: torch.Tensor, starts: torch.Tensor, seq_len: int, chunk: int):
+    """Gather x:[B,seq_len], y:[B,chunk] from CPU tensor."""
+    ar = torch.arange(seq_len + chunk, dtype=torch.long)
+    idx = starts[:, None].to(torch.long) + ar[None, :]
+    batch = corpus_u8[idx]
+    x = batch[:, :seq_len]
+    y = batch[:, seq_len:]
+    return x.to(torch.long), y.to(torch.long)
 
 
 def main():
@@ -44,6 +101,7 @@ def main():
     ap.add_argument("--ckpt", default="chunklm_ckpt.pt")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--log-every", type=int, default=50)
+
     ap.add_argument("--no-sawtooth", action="store_true")
     ap.add_argument("--use-ema", action="store_true")
     ap.add_argument("--ema-chunk-len", type=int, default=16)
@@ -57,7 +115,6 @@ def main():
     if not os.path.exists(args.data):
         raise SystemExit(f"Missing data: {args.data}")
 
-    # reuse backbone config
     cfg = tff.TrainConfig(
         data_path=args.data,
         seq_len=args.seq_len,
@@ -131,12 +188,12 @@ def main():
         )
 
     print("=" * 70)
-    print("TRAIN CHUNK HEAD (Piston Engine)")
+    print("TRAIN CHUNK LM (single script: body + mouth)")
     print("=" * 70)
     print(f"device={device} seq_len={cfg.seq_len} kernel_len={cfg.kernel_len} chunk={args.chunk}")
-    print(f"ema: use={args.use_ema} mode={args.ema_mode} ema_chunk_len={args.ema_chunk_len} ema_rho_init={args.ema_rho_init}")
     print(f"micro_batch={cfg.batch_size} accum={cfg.accum_steps} effective={cfg.batch_size*cfg.accum_steps}")
     print(f"steps/epoch={cfg.steps_per_epoch} epochs={cfg.epochs} lr={cfg.lr} wd={cfg.weight_decay}")
+    print(f"ema: use={args.use_ema} mode={args.ema_mode} ema_chunk_len={args.ema_chunk_len} ema_rho_init={args.ema_rho_init}")
     if not args.no_sawtooth:
         print(
             f"LR sched: sawtooth cosine restarts (stage-aligned)"
@@ -145,8 +202,8 @@ def main():
             f"  s3(e{cfg.stage1_epochs+cfg.stage2_epochs}+) mult {cfg.stage3_lr_mult}->{cfg.stage3_min_mult}"
         )
     print(f"corpus_bytes={n:,}")
-    params = sum(p.numel() for p in model.parameters())
-    print(f"params={params:,} (~{params/1e6:.2f}M)")
+    print(f"params={sum(p.numel() for p in model.parameters()):,}")
+    print(f"ckpt={cfg.ckpt_path}")
     print("=" * 70)
 
     t0 = time.time()
@@ -218,7 +275,7 @@ def main():
                 by = by.to(device, non_blocking=True)
 
                 with torch.autocast("cuda", enabled=cfg.amp):
-                    logits = model(bx, cutoff=current_cutoff)  # [B,chunk,256]
+                    logits = model(bx, cutoff=current_cutoff)
                     loss = loss_fn(logits.reshape(-1, 256), by.reshape(-1))
                     loss = loss / float(cfg.accum_steps)
 
@@ -247,14 +304,11 @@ def main():
                 last_saved_epoch = epoch + 1
 
     except KeyboardInterrupt:
-        # Save on Ctrl+C
         print("\n[Ctrl+C] Saving checkpoint...")
-        # Save the current epoch index (best-effort)
         save(max(last_saved_epoch, start_epoch))
         print(f"Saved to {cfg.ckpt_path}")
         raise
     finally:
-        # Always save a final checkpoint at exit
         save(max(last_saved_epoch, start_epoch))
 
     print("DONE")

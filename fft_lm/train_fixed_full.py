@@ -42,6 +42,11 @@ class TrainConfig:
     seq_len: int = 1024  # context length
     kernel_len: int = 128  # causal conv kernel length (per block)
     ffn_mult: int = 2  # feedforward expansion factor (improves capacity)
+    # FREQUENCY-NATIVE MODE (experimental)
+    frequency_native: bool = False  # Use phase activations instead of time-domain FFN
+    use_fp32: bool = False  # Force FP32 for frequency operations (better for complex arithmetic)
+    # BICAMERAL MODE (two-hemisphere architecture)
+    bicameral: bool = False  # Use dual-path: frequency (global) + time (local)
     # training
     batch_size: int = 8
     accum_steps: int = 1  # gradient accumulation micro-steps per optimizer step
@@ -87,16 +92,16 @@ class TrainConfig:
     log_every_steps: int = 50  # per-epoch step progress (prevents "stuck" feeling)
 
     # Sawtooth LR schedule (cosine annealing with stage-aligned restarts)
-    stage1_epochs: int = 5
-    stage2_epochs: int = 10  # epochs 5..14
+    # IMPORTANT: Stage durations must align with expected cutoff raises!
+    # Cutoff progression: 128 (epoch 0) → 512 (epoch 1+) - SIMPLE 2-STAGE
+    stage1_epochs: int = 1  # Epoch 0: cutoff=128, learn basic character frequencies
+    stage2_epochs: int = 3  # Epochs 1-3: cutoff=512, full resolution learning
     stage1_lr_mult: float = 1.0
     stage1_min_mult: float = 0.1
-    stage2_lr_mult: float = 0.5
-    stage2_min_mult: float = 0.05
-    # Stage 3 was decaying to microscopic LR (e.g., 2e-6 when base_lr=2e-4).
-    # That can stall learning at the "HD" stage (longer context / sharper cutoff).
-    # Keep Stage 3 floor higher so the optimizer can still move.
-    stage3_lr_mult: float = 0.5
+    stage2_lr_mult: float = 1.0  # RESTART to full LR when cutoff raises at epoch 1
+    stage2_min_mult: float = 0.1
+    # Stage 3: epoch 4+, continue at cutoff=512
+    stage3_lr_mult: float = 1.0
     stage3_min_mult: float = 0.05
 
 
@@ -214,11 +219,17 @@ def jpeg_cutoff(epoch: int, cfg: TrainConfig, freq_bins: int) -> int:
     return int(min(target, freq_bins))
 
 
-def sawtooth_lr(global_step: int, epoch: int, cfg: TrainConfig) -> float:
+def sawtooth_lr(global_step: int, epoch: int, cfg: TrainConfig, *, cutoff_raised: bool = False) -> float:
     """Cosine annealing with restarts aligned to the curriculum stages.
 
     base LR = cfg.lr. Within each stage, LR decays from (base*stage_lr_mult)
     down to (base*stage_min_mult).
+    
+    Args:
+        global_step: Global optimizer step number
+        epoch: Current epoch
+        cfg: Training config
+        cutoff_raised: If True, FORCE LR restart to maximum (Shock & Awe protocol)
     """
     s_per = int(cfg.steps_per_epoch)
     e1 = int(cfg.stage1_epochs)
@@ -239,6 +250,10 @@ def sawtooth_lr(global_step: int, epoch: int, cfg: TrainConfig) -> float:
         stage_epochs = max(1, int(cfg.epochs) - e2)
         lr_mult = cfg.stage3_lr_mult
         min_mult = cfg.stage3_min_mult
+
+    # SHOCK & AWE: If cutoff was just raised, restart LR to peak
+    if cutoff_raised:
+        return float(cfg.lr * lr_mult)
 
     stage_total_steps = max(1, stage_epochs * s_per)
     local_step = max(0, int(global_step) - int(stage_start))
@@ -262,21 +277,151 @@ def lr_stage_params(epoch: int, cfg: TrainConfig) -> tuple[str, float, float]:
 
 
 def curriculum_cutoff(epoch: int, cfg: TrainConfig, freq_bins: int) -> int:
-    """Spectral Curriculum Learning (strict stages).
+    """Spectral Curriculum Learning (simple 2-stage).
 
-    Stage 1 (epoch 0-4): 128 bins  (vibe / flow)
-    Stage 2 (epoch 5-14): 256 bins (structure / word forms)
-    Stage 3 (epoch 15+): 512 bins  (detail / spelling)
+    Stage 1 (epoch 0-4): 128 bins  (basic character frequencies)
+    Stage 2 (epoch 5+):  512 bins  (full resolution - Nyquist limit)
 
+    Skip 256 - unnecessary middle step. Jump straight to full resolution.
     Values are capped to available freq_bins.
     """
     if epoch < 5:
         target = 128
-    elif epoch < 15:
-        target = 256
     else:
-        target = 512
+        target = 512  # Jump straight to full resolution
     return int(min(target, freq_bins))
+
+
+def adaptive_cutoff(
+    epoch: int,
+    current_cutoff: int,
+    loss_history: list[float],
+    freq_bins: int,
+    *,
+    min_epoch_before_raise: int = 1,
+    plateau_window: int = 50,
+    plateau_threshold: float = 0.005,
+) -> tuple[int, bool]:
+    """Dynamic cutoff based on loss plateau detection (The Plateau Rule).
+    
+    Args:
+        epoch: Current epoch number
+        current_cutoff: Current frequency cutoff
+        loss_history: Recent loss values (last N optimizer steps)
+        freq_bins: Maximum available frequency bins
+        min_epoch_before_raise: Minimum epoch before first cutoff raise (default 1)
+        plateau_window: Number of recent losses to check for plateau
+        plateau_threshold: Max relative change to consider a plateau
+        
+    Returns:
+        (new_cutoff, cutoff_raised): New cutoff value and whether it was raised
+    """
+    # Never raise before minimum epoch
+    if epoch < min_epoch_before_raise:
+        return current_cutoff, False
+    
+    # Already at maximum
+    if current_cutoff >= freq_bins:
+        return current_cutoff, False
+    
+    # Need enough history to detect plateau
+    if len(loss_history) < plateau_window:
+        return current_cutoff, False
+    
+    # Check for plateau: compare recent average vs older average
+    recent = loss_history[-plateau_window:]
+    if len(recent) < 2:
+        return current_cutoff, False
+    
+    # Calculate trend: if loss is not dropping significantly, it's a plateau
+    first_half = recent[: plateau_window // 2]
+    second_half = recent[plateau_window // 2 :]
+    
+    avg_first = sum(first_half) / len(first_half)
+    avg_second = sum(second_half) / len(second_half)
+    
+    # Relative improvement
+    if avg_first > 0:
+        rel_improvement = (avg_first - avg_second) / avg_first
+    else:
+        rel_improvement = 0.0
+    
+    # Plateau detected: loss not improving enough
+    if rel_improvement < plateau_threshold:
+        # Simple curriculum: 128 -> 512 (skip 256)
+        # Never go below 128 (64 is too blurry, no point)
+        if current_cutoff < 512:
+            new_cutoff = 512  # Jump straight to full resolution
+        else:
+            new_cutoff = freq_bins  # Already at Nyquist
+        
+        new_cutoff = min(new_cutoff, freq_bins)
+        return new_cutoff, new_cutoff > current_cutoff
+    
+    return current_cutoff, False
+
+
+def plateau_cutoff(
+    current_cutoff: int,
+    recent_loss: float,
+    freq_bins: int,
+    best_loss_at_cutoff: float,
+    steps_without_improvement: int,
+    *,
+    patience: int = 50,
+    improvement_threshold: float = 0.01,
+) -> tuple[int, bool, float, int]:
+    """PLATEAU-BASED cutoff: Unlock when STUCK, not when winning!
+    
+    CORRECT PHILOSOPHY:
+    - Let the model MASTER the current frequency band
+    - Only unlock when it PLATEAUS (can't improve anymore)
+    - This ensures solid foundations before adding complexity
+    
+    Like weight training: Don't add weight until you can't do more reps!
+    
+    Args:
+        current_cutoff: Current frequency cutoff
+        recent_loss: Recent average loss (last 10 steps)
+        freq_bins: Maximum available frequency bins (Nyquist limit: seq_len//2 + 1)
+        best_loss_at_cutoff: Best loss achieved at current cutoff
+        steps_without_improvement: Counter for plateau detection
+        patience: How many steps without improvement before unlock (default 50)
+        improvement_threshold: Minimum improvement to reset counter (default 0.01)
+        
+    Returns:
+        (new_cutoff, cutoff_raised, new_best_loss, new_counter)
+    """
+    # Already at maximum (Nyquist limit)
+    if current_cutoff >= freq_bins:
+        return current_cutoff, False, best_loss_at_cutoff, steps_without_improvement
+    
+    # Check if we improved
+    if recent_loss < best_loss_at_cutoff - improvement_threshold:
+        # NEW PERSONAL BEST! Keep training at this level
+        return current_cutoff, False, recent_loss, 0  # Reset counter
+    else:
+        # No improvement, increment stall counter
+        new_counter = steps_without_improvement + 1
+        
+        # Check if we've plateaued (stuck for too long)
+        if new_counter >= patience:
+            # PLATEAU DETECTED! Unlock to help model improve further
+            # Simple curriculum: 128 -> 512 (Nyquist limit, full resolution)
+            # Skip 256 - it's an unnecessary middle step
+            if current_cutoff < 512:
+                new_cutoff = 512  # Jump straight to full resolution
+            else:
+                new_cutoff = freq_bins  # Already at Nyquist
+            
+            # Cap at Nyquist limit
+            new_cutoff = min(new_cutoff, freq_bins)
+            
+            if new_cutoff > current_cutoff:
+                # Reset best loss for new cutoff (expect spike then improvement)
+                return new_cutoff, True, float('inf'), 0
+        
+        return current_cutoff, False, best_loss_at_cutoff, new_counter
 
 
 class FixedSpectralBlock(nn.Module):
@@ -423,9 +568,23 @@ class FixedSpectralLM(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        
+        # Choose architecture based on flags
+        if cfg.bicameral:
+            from fft_lm.bicameral import BicameralBlock
+            block_class = BicameralBlock
+            print("[BICAMERAL] Dual-hemisphere: Frequency (global) + Time (local)")
+        elif cfg.frequency_native:
+            from fft_lm.frequency_native import FrequencyNativeBlock
+            block_class = FrequencyNativeBlock
+            print("[FREQUENCY-NATIVE] Phase activations, no time-domain roundtrips")
+        else:
+            block_class = FixedSpectralBlock
+            print("[STANDARD] Time-domain FFN with GELU")
+        
         self.blocks = nn.ModuleList(
             [
-                FixedSpectralBlock(
+                block_class(
                     cfg.d_model,
                     seq_len=cfg.seq_len,
                     kernel_len=cfg.kernel_len,

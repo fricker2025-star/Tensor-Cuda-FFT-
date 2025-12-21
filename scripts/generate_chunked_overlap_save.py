@@ -33,6 +33,7 @@ import torch.nn.functional as F
 
 from fft_lm import train_fixed_full as tff
 from fft_lm.chunk_head import ChunkLM
+from fft_lm.ckpt_io import load_checkpoint
 
 
 def apply_top_p(logits_1d: torch.Tensor, p: float) -> torch.Tensor:
@@ -81,6 +82,7 @@ def overlap_save_block_update(
     *,
     n_fft_full: int,
     kernel_len: int,
+    cache: dict | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Update a single block for a chunk using overlap-save.
 
@@ -113,8 +115,13 @@ def overlap_save_block_update(
     pooled = (ctx_sum_new / float(ctx_ln_new.size(1))).to(dtype=torch.float32)  # [1,C]
     g_ctx = torch.sigmoid(blk.gate_ctx(pooled.to(dtype=next(blk.gate_ctx.parameters()).dtype))).to(torch.float32)  # [1,C]
 
-    # per-frequency gate
-    g_freq = torch.sigmoid(blk.gate_freq_logits[: (n_fft_full // 2 + 1)]).to(torch.float32)  # [F]
+    Fbins = (n_fft_full // 2 + 1)
+
+    # per-frequency gate (cacheable at inference)
+    if cache is not None and "g_freq" in cache:
+        g_freq = cache["g_freq"]
+    else:
+        g_freq = torch.sigmoid(blk.gate_freq_logits[:Fbins]).to(torch.float32)  # [F]
 
     # 3) overlap-save convolution using fixed FFT size
     # build segment of length L = (K-1)+B from last K-1 ctx_ln_new and current ln_chunk
@@ -136,13 +143,20 @@ def overlap_save_block_update(
     x_pad_f = x_pad.to(torch.float32)
     x_freq = torch.fft.rfft(x_pad_f, dim=1)  # [1,F,C] complex64
 
-    # kernel freq (fixed)
-    k = torch.zeros(n_fft_full, device=device, dtype=torch.float32)
-    k[:kernel_len] = blk.kernel.to(torch.float32)
-    k_freq = torch.fft.rfft(k)  # [F]
+    # kernel freq (cacheable at inference)
+    if cache is not None and "k_freq" in cache:
+        k_freq = cache["k_freq"]
+    else:
+        k = torch.zeros(n_fft_full, device=device, dtype=torch.float32)
+        k[:kernel_len] = blk.kernel.to(torch.float32)
+        k_freq = torch.fft.rfft(k)  # [F]
 
     # apply kernel, gain, gates
-    gain = blk.gain.to(torch.float32).view(1, 1, -1)
+    if cache is not None and "gain" in cache:
+        gain = cache["gain"]
+    else:
+        gain = blk.gain.to(torch.float32)
+    gain = gain.view(1, 1, -1)
     y_freq = x_freq * k_freq.view(1, -1, 1) * gain
     y_freq = y_freq * g_freq.view(1, -1, 1) * g_ctx.view(1, 1, -1)
 
@@ -174,6 +188,7 @@ def update_backbone_chunk(backbone: tff.FixedSpectralLM, states: dict, new_ids: 
     # (since bins = n_fft//2+1) => n_fft = (bins-1)*2
     kernel_len = backbone.cfg.kernel_len
 
+    caches = states.get("caches")
     for li, blk in enumerate(backbone.blocks):
         h_chunk, new_layer_state = overlap_save_block_update(
             blk,
@@ -181,6 +196,7 @@ def update_backbone_chunk(backbone: tff.FixedSpectralLM, states: dict, new_ids: 
             h_chunk,
             n_fft_full=n_fft_full,
             kernel_len=kernel_len,
+            cache=(caches[li] if caches is not None else None),
         )
         states["layers"][li] = new_layer_state
 
@@ -207,13 +223,38 @@ def main():
     if device == "cpu":
         raise SystemExit("CUDA required")
 
-    ck = torch.load(args.ckpt, map_location="cpu")
+    ck = load_checkpoint(args.ckpt, map_location="cpu")
+
+    # prefer checkpoint cfg when present
     cfg = tff.TrainConfig(seq_len=args.seq_len, kernel_len=args.kernel_len)
+    if "cfg" in ck and isinstance(ck["cfg"], dict):
+        for k, v in ck["cfg"].items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+        # CLI override remains authoritative
+        cfg.seq_len = args.seq_len
+        cfg.kernel_len = args.kernel_len
     cfg.device = device
     backbone = tff.FixedSpectralLM(cfg).to(device)
-    model = ChunkLM(backbone, chunk=args.chunk).to(device)
+    # If checkpoint recorded chunk size, respect it unless CLI forces a value.
+    ckpt_chunk = int(ck.get("chunk", args.chunk))
+    model = ChunkLM(backbone, chunk=ckpt_chunk).to(device)
     model.load_state_dict(ck["model"], strict=True)
     model.eval()
+
+    # Precompute per-layer caches for exact overlap-save updates.
+    n_fft_full = tff.conv_freq_bins(cfg.seq_len, cfg.kernel_len) * 2 - 2
+    Fbins = n_fft_full // 2 + 1
+    caches = []
+    for blk in backbone.blocks:
+        # kernel FFT
+        k = torch.zeros(n_fft_full, device=device, dtype=torch.float32)
+        k[: cfg.kernel_len] = blk.kernel.detach().to(torch.float32)
+        k_freq = torch.fft.rfft(k)  # [F] complex64
+        # frequency gate
+        g_freq = torch.sigmoid(blk.gate_freq_logits.detach()[:Fbins]).to(torch.float32)
+        gain = blk.gain.detach().to(torch.float32)
+        caches.append({"k_freq": k_freq, "g_freq": g_freq, "gain": gain})
 
     prompt = " ".join(args.prompt)
     ctx = list(prompt.encode("utf-8", errors="ignore"))
@@ -228,6 +269,8 @@ def main():
     x0 = torch.tensor([init_ids], dtype=torch.long, device=device)
 
     states = init_layer_states(backbone, x0)
+    # Attach caches to the state dict so update_backbone_chunk can access them.
+    states["caches"] = caches
 
     generated = init_ids[:]  # include padding; sampling uses recent window anyway
 
