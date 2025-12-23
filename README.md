@@ -64,6 +64,302 @@ class MyModel(nn.Module):
 
 ---
 
+## GitHub Codespaces Setup Guide
+
+### What is GitHub Codespaces?
+
+GitHub Codespaces provides cloud-based development environments with pre-configured compute resources. For this project, you can use Codespaces to develop and test FFT-Tensor without local GPU setup.
+
+### Machine Types Available
+
+GitHub Codespaces offers several machine configurations. Choose based on your needs:
+
+#### CPU-Only Machines
+
+| Machine Type | vCPUs | RAM | Storage | Best For |
+|-------------|-------|-----|---------|----------|
+| 2-core | 2 | 8 GB | 32 GB | Documentation, code review |
+| 4-core | 4 | 16 GB | 32 GB | **Recommended for CPU testing** |
+| 8-core | 8 | 32 GB | 64 GB | Large-scale CPU experiments |
+| 16-core | 16 | 64 GB | 128 GB | Heavy CPU workloads |
+| 32-core | 32 | 128 GB | 256 GB | Extreme CPU-intensive tasks |
+
+#### GPU-Enabled Machines (Limited Availability)
+
+**Note:** GPU support in Codespaces is currently in limited beta. Availability varies by organization.
+
+| Machine Type | GPU | vCPUs | RAM | Best For |
+|-------------|-----|-------|-----|----------|
+| 4-core + T4 | NVIDIA T4 (16 GB) | 4 | 16 GB | **Recommended for this project** |
+| 8-core + T4 | NVIDIA T4 (16 GB) | 8 | 32 GB | Training experiments |
+| 4-core + A10 | NVIDIA A10 (24 GB) | 4 | 32 GB | Large models (if available) |
+
+**GPU Notes:**
+- T4 GPUs have compute capability 7.5 (similar to GTX 1660 Super used in benchmarks)
+- A10 GPUs have compute capability 8.6 (Ampere architecture)
+- GPU availability depends on your GitHub plan and organization settings
+
+### Step-by-Step Setup on GitHub Codespaces
+
+#### 1. Create a Codespace
+
+```bash
+# From the GitHub repository page:
+# 1. Click the green "Code" button
+# 2. Select "Codespaces" tab
+# 3. Click "Create codespace on main"
+# 4. (Optional) Click "..." → "New with options" to select machine type
+```
+
+**Recommended:** Select **4-core** for CPU-only or **4-core + T4** if GPU is available.
+
+#### 2. Wait for Environment Setup
+
+The Codespace will initialize (typically 2-5 minutes). You'll see a VS Code interface in your browser.
+
+#### 3. Verify Python and CUDA (if GPU)
+
+```bash
+# Check Python version (should be 3.10+)
+python --version
+
+# Check if CUDA is available (GPU machines only)
+nvidia-smi
+
+# Check PyTorch CUDA availability
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+```
+
+#### 4. Install Dependencies
+
+**For CPU-only Codespaces:**
+
+```bash
+# Install PyTorch (CPU version)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install other dependencies
+pip install -r requirements.txt
+
+# Install package in editable mode
+pip install -e .
+```
+
+**For GPU-enabled Codespaces:**
+
+```bash
+# Install PyTorch with CUDA support
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install other dependencies
+pip install -r requirements.txt
+
+# Install package in editable mode (CUDA extensions may not compile without nvcc)
+pip install -e . || echo "CUDA extensions skipped - using PyTorch fallback"
+```
+
+**Note:** CUDA compilation may fail if `nvcc` is not available. This is normal - the package will fall back to PyTorch implementations.
+
+#### 5. Run Tests
+
+```bash
+# Run core tests
+python -m pytest tests/ -v
+
+# Test spectral operations
+python -m fft_tensor.spectral_layers
+
+# Test Wirtinger calculus
+python -m fft_tensor.wirtinger_ops
+```
+
+**Expected:** 33/35 tests passing (94%). CUDA-specific tests will be skipped on CPU machines.
+
+#### 6. Run a Quick Example
+
+```bash
+# Test basic usage
+python examples/basic_usage.py
+
+# Test neural network integration
+python examples/neural_network.py
+```
+
+#### 7. Benchmark Performance (GPU only)
+
+```bash
+# Run benchmarks on GPU
+python benchmark_spectral.py
+
+# Enhanced benchmarks
+python benchmark_enhanced.py
+```
+
+### Hardware-Specific Considerations
+
+#### CPU-Only Development
+
+**What works:**
+- ✅ All core spectral tensor operations
+- ✅ Training small models (<512 sequence length)
+- ✅ Code development and testing
+- ✅ Documentation
+
+**What's slow:**
+- ⚠️ FFT operations (10-50x slower than GPU)
+- ⚠️ Long sequence processing (>1024 tokens)
+- ⚠️ Large-scale training
+
+**Optimization tips:**
+```python
+# Use smaller batch sizes
+batch_size = 2  # instead of 8
+
+# Shorter sequences for testing
+seq_len = 256  # instead of 1024
+
+# Fewer training steps
+steps_per_epoch = 100  # instead of 1000
+```
+
+#### GPU Development (T4)
+
+**What works:**
+- ✅ Full training pipeline
+- ✅ Real-time inference
+- ✅ Benchmarking
+- ✅ All performance features
+
+**Performance expectations:**
+- T4 performance similar to GTX 1660 Super (our benchmark GPU)
+- 10-215x speedup over CPU for long sequences
+- 16 GB VRAM sufficient for most experiments
+
+**Optimization tips:**
+```bash
+# Train with recommended settings
+python -m fft_lm.train_fixed_full --seq-len 1024 --kernel-len 128 \
+  --lr 0.0002 --batch-size 4 --accum-steps 8 --steps-per-epoch 1000 \
+  --epochs 200 --ckpt-path spectral_ckpt.pt
+```
+
+#### GPU Development (A10 - if available)
+
+**What works:**
+- ✅ Everything T4 can do
+- ✅ Larger models (24 GB VRAM)
+- ✅ Bigger batch sizes
+- ✅ Longer sequences (up to 4096 tokens)
+
+**Optimization tips:**
+```bash
+# Use larger batches
+--batch-size 8 --accum-steps 4
+
+# Longer sequences
+--seq-len 2048
+```
+
+### Verification Checklist
+
+After setup, verify your environment:
+
+```bash
+# 1. Check package installation
+python -c "from fft_tensor import SpectralMixingLayer; print('✓ Package imported')"
+
+# 2. Check CUDA (GPU only)
+python -c "import torch; print(f'✓ CUDA: {torch.cuda.is_available()}')"
+
+# 3. Run a quick test
+python -c "
+import torch
+from fft_tensor.spectral_layers import SpectralMixingLayer
+layer = SpectralMixingLayer(embed_dim=256)
+x = torch.randn(2, 128, 256)
+y = layer(x)
+print(f'✓ Basic test passed: {y.shape}')
+"
+
+# 4. Check test suite
+python -m pytest tests/test_spectral_layers.py -v
+```
+
+### Troubleshooting
+
+#### Issue: "CUDA not available" on GPU Codespace
+
+```bash
+# Check NVIDIA driver
+nvidia-smi
+
+# Reinstall PyTorch with CUDA
+pip uninstall torch
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+#### Issue: CUDA extension compilation fails
+
+**Solution:** This is expected. The package works without compiled CUDA extensions using PyTorch fallback.
+
+```bash
+# Install without building extensions
+pip install -e . --no-build-isolation || pip install -e .
+```
+
+#### Issue: Out of memory errors
+
+```bash
+# Reduce batch size
+--batch-size 2
+
+# Reduce sequence length
+--seq-len 512
+
+# Enable gradient accumulation
+--accum-steps 16
+```
+
+#### Issue: Tests failing
+
+```bash
+# Update dependencies
+pip install --upgrade torch numpy scipy
+
+# Clear cache and reinstall
+pip cache purge
+pip install -e . --force-reinstall --no-cache-dir
+```
+
+### Cost Considerations
+
+**Free tier:**
+- 120 core-hours/month for personal accounts
+- 2-core machine: ~60 hours/month
+- 4-core machine: ~30 hours/month
+
+**GPU machines:**
+- Typically require paid plan or organization access
+- Higher per-hour cost
+- Check GitHub billing for current rates
+
+**Cost optimization:**
+- Stop Codespaces when not in use (they auto-stop after 30 min idle)
+- Use CPU machines for development, GPU for testing/benchmarking
+- Delete unused Codespaces regularly
+
+### Next Steps
+
+Once your Codespace is set up:
+
+1. **Explore examples:** Start with `examples/basic_usage.py`
+2. **Read architecture:** Check [ARCHITECTURE.md](ARCHITECTURE.md) for theory
+3. **Run benchmarks:** Compare CPU vs GPU performance
+4. **Train a model:** Follow the Language Model section above
+5. **Contribute:** See [CONTRIBUTING.md](CONTRIBUTING.md)
+
+---
+
 ## Documentation
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - Theory, Wirtinger calculus, design decisions
